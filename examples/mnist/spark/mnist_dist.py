@@ -6,11 +6,11 @@
 
 from __future__ import absolute_import
 from __future__ import division
+from __future__ import nested_scopes
 from __future__ import print_function
 
 def print_log(worker_num, arg):
-  print("%d: " %worker_num, end=" ")
-  print(arg)
+  print("{0}: {1}".format(worker_num, arg))
 
 def map_fun(args, ctx):
   from com.yahoo.ml.tf import TFNode
@@ -33,15 +33,12 @@ def map_fun(args, ctx):
 
   # Parameters
   hidden_units = 128
-  batch_size   = 100
+  batch_size   = args.batch_size
 
   # Get TF cluster and server instances
   cluster, server = TFNode.start_cluster_server(ctx, 1, args.rdma)
 
-  def feed_dict():
-    # Get a batch of examples from spark data feeder job
-    batch = TFNode.next_batch(ctx.mgr, 100)
-
+  def feed_dict(batch):
     # Convert from [(images, labels)] to two numpy arrays of the proper type
     images = []
     labels = []
@@ -68,15 +65,20 @@ def map_fun(args, ctx):
       hid_w = tf.Variable(tf.truncated_normal([IMAGE_PIXELS * IMAGE_PIXELS, hidden_units],
                               stddev=1.0 / IMAGE_PIXELS), name="hid_w")
       hid_b = tf.Variable(tf.zeros([hidden_units]), name="hid_b")
+      tf.summary.histogram("hidden_weights", hid_w)
 
       # Variables of the softmax layer
       sm_w = tf.Variable(tf.truncated_normal([hidden_units, 10],
                               stddev=1.0 / math.sqrt(hidden_units)), name="sm_w")
       sm_b = tf.Variable(tf.zeros([10]), name="sm_b")
+      tf.summary.histogram("softmax_weights", sm_w)
 
       # Placeholders or QueueRunner/Readers for input data
       x = tf.placeholder(tf.float32, [None, IMAGE_PIXELS * IMAGE_PIXELS], name="x")
       y_ = tf.placeholder(tf.float32, [None, 10], name="y_")
+
+      x_img = tf.reshape(x, [-1, IMAGE_PIXELS, IMAGE_PIXELS, 1])
+      tf.summary.image("x_img", x_img)
 
       hid_lin = tf.nn.xw_plus_b(x, hid_w, hid_b)
       hid = tf.nn.relu(hid_lin)
@@ -86,6 +88,8 @@ def map_fun(args, ctx):
       global_step = tf.Variable(0)
 
       loss = -tf.reduce_sum(y_ * tf.log(tf.clip_by_value(y, 1e-10, 1.0)))
+      tf.summary.scalar("loss", loss)
+
       train_op = tf.train.AdagradOptimizer(0.01).minimize(
           loss, global_step=global_step)
 
@@ -93,7 +97,9 @@ def map_fun(args, ctx):
       label = tf.argmax(y_, 1, name="label")
       prediction = tf.argmax(y, 1,name="prediction")
       correct_prediction = tf.equal(prediction, label)
+
       accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32), name="accuracy")
+      tf.summary.scalar("acc", accuracy)
 
       saver = tf.train.Saver()
       summary_op = tf.summary.merge_all()
@@ -108,15 +114,15 @@ def map_fun(args, ctx):
       sv = tf.train.Supervisor(is_chief=(task_index == 0),
                                logdir=logdir,
                                init_op=init_op,
-                               summary_op=summary_op,
+                               summary_op=None,
                                saver=saver,
                                global_step=global_step,
-                               summary_writer=summary_writer,
                                stop_grace_secs=300,
                                save_model_secs=10)
     else:
       sv = tf.train.Supervisor(is_chief=(task_index == 0),
                                logdir=logdir,
+                               summary_op=None,
                                saver=saver,
                                global_step=global_step,
                                stop_grace_secs=300,
@@ -129,34 +135,34 @@ def map_fun(args, ctx):
 
       # Loop until the supervisor shuts down or 1000000 steps have completed.
       step = 0
-      count = 0
-      while not sv.should_stop() and step < args.steps:
+      tf_feed = TFNode.DataFeed(ctx.mgr, args.mode == "train")
+      while not sv.should_stop() and not tf_feed.should_stop() and step < args.steps:
         # Run a training step asynchronously.
         # See `tf.train.SyncReplicasOptimizer` for additional details on how to
         # perform *synchronous* training.
 
         # using feed_dict
-        batch_xs, batch_ys = feed_dict()
+        batch_xs, batch_ys = feed_dict(tf_feed.next_batch(batch_size))
         feed = {x: batch_xs, y_: batch_ys}
 
-        if len(batch_xs) != batch_size:
-          print("done feeding")
-          break
-        else:
+        if len(batch_xs) > 0:
           if args.mode == "train":
-            _, step = sess.run([train_op, global_step], feed_dict=feed)
+            _, summary, step = sess.run([train_op, summary_op, global_step], feed_dict=feed)
             # print accuracy and save model checkpoint to HDFS every 100 steps
             if (step % 100 == 0):
               print("{0} step: {1} accuracy: {2}".format(datetime.now().isoformat(), step, sess.run(accuracy,{x: batch_xs, y_: batch_ys})))
-          else: # args.mode == "inference"
-              labels, preds, acc = sess.run([label, prediction, accuracy], feed_dict=feed)
 
-              results = ["{0} Label: {1}, Prediction: {2}".format(datetime.now().isoformat(), l, p) for l,p in zip(labels,preds)]
-              TFNode.batch_results(ctx.mgr, results)
-              print("acc: {0}".format(acc))
+            if sv.is_chief:
+              summary_writer.add_summary(summary, step)
+          else: # args.mode == "inference"
+            labels, preds, acc = sess.run([label, prediction, accuracy], feed_dict=feed)
+
+            results = ["{0} Label: {1}, Prediction: {2}".format(datetime.now().isoformat(), l, p) for l,p in zip(labels,preds)]
+            tf_feed.batch_results(results)
+            print("acc: {0}".format(acc))
 
       if sv.should_stop() or step >= args.steps:
-        TFNode.terminate(ctx.mgr)
+        tf_feed.terminate()
 
     # Ask for all the services to stop.
     print("{0} stopping supervisor".format(datetime.now().isoformat()))
